@@ -12,7 +12,6 @@ using Microsoft.OpenApi.Models;
 using Para.Api.Middleware;
 using Para.Api.Service;
 using Para.Base;
-using Para.Base.Log;
 using Para.Base.Token;
 using Para.Bussiness;
 using Para.Bussiness.Cqrs;
@@ -20,9 +19,13 @@ using Para.Bussiness.Notification;
 using Para.Bussiness.Token;
 using Para.Bussiness.Validation;
 using Para.Data.Context;
+using Para.Data.Domain;
 using Para.Data.UnitOfWork;
 using Serilog;
 using StackExchange.Redis;
+using Microsoft.Extensions.Options;
+using Para.Bussiness.Email;
+using Para.Bussiness.RabbitMQ;
 
 namespace Para.Api;
 
@@ -35,7 +38,6 @@ public class Startup
     {
         this.Configuration = configuration;
     }
-
 
     public void ConfigureServices(IServiceCollection services)
     {
@@ -59,10 +61,8 @@ public class Startup
             x.RegisterValidatorsFromAssemblyContaining<BaseValidator>();
         });
 
-
         var config = new MapperConfiguration(cfg => { cfg.AddProfile(new MapperConfig()); });
         services.AddSingleton(config.CreateMapper());
-
 
         services.AddMediatR(typeof(CreateCustomerCommand).GetTypeInfo().Assembly);
 
@@ -93,7 +93,6 @@ public class Startup
                 ClockSkew = TimeSpan.FromMinutes(2)
             };
         });
-
 
         services.AddSwaggerGen(c =>
         {
@@ -129,15 +128,20 @@ public class Startup
             opt.ConfigurationOptions = redisConfig;
             opt.InstanceName = Configuration["Redis:InstanceName"];
         });
-        
-        
+
         services.AddHangfire(configuration => configuration
             .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
             .UseSimpleAssemblyNameTypeSerializer()
             .UseRecommendedSerializerSettings()
-            .UseSqlServerStorage(Configuration.GetConnectionString("HangfireConnection")));
-        services.AddHangfireServer();
-        
+            .UseSqlServerStorage(Configuration.GetConnectionString("HangfireConnection"))); //Yeni yaz
+        services.AddHangfireServer(); //Yeni yaz
+
+        services.Configure<RabbitMQSettings>(Configuration.GetSection("RabbitMQ")); //Yeni yaz
+        services.Configure<Para.Bussiness.Email.SmtpSettings>(Configuration.GetSection("Smtp")); //Yeni yaz
+
+        services.AddSingleton<RabbitMQService>(); //Yeni yaz
+        services.AddTransient<EmailService>(); //Yeni yaz
+        services.AddTransient<EmailJob>(); //Yeni yaz
 
         services.AddScoped<ISessionContext>(provider =>
         {
@@ -149,7 +153,7 @@ public class Startup
         });
     }
 
-    public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+    public void Configure(IApplicationBuilder app, IWebHostEnvironment env, IBackgroundJobClient backgroundJobs) //Yeni yaz
     {
         if (env.IsDevelopment())
         {
@@ -157,7 +161,19 @@ public class Startup
             app.UseSwagger();
             app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "Para.Api v1"));
         }
+        else
+        {
+            app.UseExceptionHandler("/Home/Error");
+            app.UseHsts();
+        }
 
+        app.UseHttpsRedirection();
+        app.UseStaticFiles();
+
+        app.UseRouting();
+
+        app.UseAuthentication();
+        app.UseAuthorization();
 
         app.UseMiddleware<HeartbeatMiddleware>();
         app.UseMiddleware<ErrorHandlerMiddleware>();
@@ -173,46 +189,12 @@ public class Startup
 
         app.UseHangfireDashboard();
 
-        app.UseHttpsRedirection();
-        app.UseAuthentication();
-        app.UseRouting();
-        app.UseAuthorization();
-        app.UseEndpoints(endpoints => { endpoints.MapControllers(); });
-
-        app.Use((context, next) =>
+        app.UseEndpoints(endpoints =>
         {
-            if (!string.IsNullOrEmpty(context.Request.Path) && context.Request.Path.Value.Contains("favicon"))
-            {
-                return next();
-            }
-
-            var service1 = context.RequestServices.GetRequiredService<CustomService1>();
-            var service2 = context.RequestServices.GetRequiredService<CustomService2>();
-            var service3 = context.RequestServices.GetRequiredService<CustomService3>();
-
-            service1.Counter++;
-            service2.Counter++;
-            service3.Counter++;
-
-            return next();
+            endpoints.MapControllers();
         });
 
-        app.Run(async context =>
-        {
-            var service1 = context.RequestServices.GetRequiredService<CustomService1>();
-            var service2 = context.RequestServices.GetRequiredService<CustomService2>();
-            var service3 = context.RequestServices.GetRequiredService<CustomService3>();
-
-            if (!string.IsNullOrEmpty(context.Request.Path) && !context.Request.Path.Value.Contains("favicon"))
-            {
-                service1.Counter++;
-                service2.Counter++;
-                service3.Counter++;
-            }
-
-            await context.Response.WriteAsync($"Service1 : {service1.Counter}\n");
-            await context.Response.WriteAsync($"Service2 : {service2.Counter}\n");
-            await context.Response.WriteAsync($"Service3 : {service3.Counter}\n");
-        });
+        RecurringJob.AddOrUpdate<EmailJob>(job => job.Execute(), "*/5 * * * * *");
     }
 }
+
